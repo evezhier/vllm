@@ -1157,6 +1157,7 @@ def use_flashinfer_prefill() -> bool:
         not vllm_config.attention_config.disable_flashinfer_prefill
         and has_flashinfer()
         and not vllm_config.attention_config.use_cudnn_prefill
+        and not vllm_config.attention_config.use_trtllm_ragged_deepseek_prefill
         and current_platform.is_device_capability_family(100)
     ):
         return False
@@ -1357,11 +1358,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             )
 
         if self._use_trtllm_ragged_prefill:
-            self._workspace_buffer = torch.empty(
+            self._workspace_buffer = torch.zeros(
                 envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
                 dtype=torch.uint8,
                 device=device,
             )
+            logger.info_once("_use_trtllm_ragged_prefill enabled, filling _workspace_buffer")
+            # self._workspace_buffer.fill_(0)
 
         if self._use_cudnn_prefill:
             self.cudnn_workspace = torch.empty(
@@ -2156,7 +2159,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             device=q.device,
             dtype=q.dtype,
         )
-        prefill.workspace_buffer.fill_(0)
+        # prefill.workspace_buffer.fill_(0)
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,

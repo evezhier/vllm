@@ -1047,6 +1047,7 @@ def test_backend_correctness(
                 backend_output, expected_output, rtol=rtol, atol=atol
             )
 
+            print(f"Max diff: {max_diff:.6f}, max rel diff: {max_rel_diff:.6f})")
             assert all_close, (
                 f"[{backend_name}] output differs from SDPA baseline. "
                 f"Max diff: {max_diff:.6f}, max rel diff: {max_rel_diff:.6f})"

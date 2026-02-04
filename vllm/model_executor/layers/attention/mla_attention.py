@@ -1364,7 +1364,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 device=device,
             )
             logger.info_once("_use_trtllm_ragged_prefill enabled, filling _workspace_buffer")
-            # self._workspace_buffer.fill_(0)
 
         if self._use_cudnn_prefill:
             self.cudnn_workspace = torch.empty(
@@ -2152,14 +2151,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.chunked_context.seq_lens[chunk_idx] is not None
         assert prefill.workspace_buffer is not None
 
-        out = torch.zeros(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=q.dtype,
-        )
+        # out = torch.zeros(
+        #     q.shape[0],
+        #     q.shape[1],
+        #     v.shape[2],
+        #     device=q.device,
+        #     dtype=q.dtype,
+        # )
+        logger.info_once(f"Running TRT-LLM ragged attention for context chunks (non-causal) with {prefill.workspace_buffer.shape}")
         # prefill.workspace_buffer.fill_(0)
+        prefill.workspace_buffer[:16*1024*1024].zero_()
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2179,7 +2180,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             enable_pdl=False,
             is_causal=False,
             return_lse=True,
-            out=out,
+            # out=out,
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)

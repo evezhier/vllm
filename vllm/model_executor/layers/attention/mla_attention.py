@@ -200,6 +200,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from pathlib import Path
+
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -1358,7 +1360,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             )
 
         if self._use_trtllm_ragged_prefill:
-            self._workspace_buffer = torch.zeros(
+            self._workspace_buffer = torch.empty(
                 envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
                 dtype=torch.uint8,
                 device=device,
@@ -2106,6 +2108,19 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # Indicates actual_seq_lens are on GPU or CPU.
             is_cuda_graph_compatible=True,
         )
+    
+    def detect_nans(self, attn_out):
+        x = attn_out.detach().cpu()
+        nans = False
+        for dim in range(x.ndim):
+            other_dims = tuple(d for d in range(x.ndim) if d != dim)
+            if torch.isnan(x).any(dim=other_dims).all() or torch.isinf(x).any(dim=other_dims).all():
+                nans = True
+                print(f"Dimension {dim} is all NaNs")
+            elif torch.isnan(x).any(dim=other_dims).any() or torch.isinf(x).any(dim=other_dims).any():
+                nans = True
+                print(f"NaNs appear along dimension {dim}")
+        return nans
 
     def _run_prefill_new_tokens_trtllm_ragged(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
@@ -2115,6 +2130,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
+
+        logger.info_once(f"TRT-LLM ragged attention for new tokens (causal)  q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+                         prefill.workspace_buffer: {prefill.workspace_buffer}, \
+                         seq_lens: {prefill.query_seq_lens}, \
+                        max_q_len: {prefill.max_query_len}, \
+                        max_kv_len: {prefill.max_query_len}, \
+                        bmm1_scale: {self.scale}, batch_size: {prefill.query_seq_lens.shape[0]}, \
+                        cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.query_start_loc}, \
+                        return_softmax_lse: {return_softmax_lse}"
+                        )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2137,9 +2162,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
         if isinstance(ret, tuple):
+            print(f"_run_prefill_new_tokens_trtllm_ragged output is a tuple")
+            attn_out = ret[0]
+            lse = ret[1].transpose(0, 1).contiguous()
+            return attn_out, lse
+        else:
             # Convert from (q_len, num_heads) to (num_heads, q_len)
-            return ret[0], ret[1].transpose(0, 1).contiguous()
-        return ret
+            print(f"_run_prefill_new_tokens_trtllm_ragged output is not a tuple but a {type(ret)}")
+            return ret
 
     def _run_prefill_context_chunk_trtllm_ragged(
         self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
@@ -2158,9 +2188,32 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         #     device=q.device,
         #     dtype=q.dtype,
         # )
-        logger.info_once(f"Running TRT-LLM ragged attention for context chunks (non-causal) with {prefill.workspace_buffer.shape}")
-        # prefill.workspace_buffer.fill_(0)
-        prefill.workspace_buffer[:16*1024*1024].zero_()
+        prefill.workspace_buffer.fill_(0)
+        logger.info_once(
+            f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+            prefill.workspace_buffer: {prefill.workspace_buffer}, \
+            seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
+            max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
+            bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
+            cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
+            )
+        # logger.info_once(f"Q: {q}")
+        print(f"_run_prefill_context_chunk_trtllm_ragged attn in: Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
+        # nans = self.detect_nans(q)
+        # if not nans: 
+        #     print(f"Q is fine")
+        
+        # logger.info_once(f"K: {k}")
+        # logger.info_once(f"")
+        # nans = self.detect_nans(k)
+        # if not nans: 
+        #     print(f"K is fine")
+
+        # logger.info_once(f"V: {v}")
+        # logger.info_once(f"V shape: {v.shape}")
+        # nans = self.detect_nans(v)
+        # if not nans: 
+        #     print(f"V is fine")
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2183,8 +2236,21 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # out=out,
         )
 
+        nans = self.detect_nans(attn_out)
+        print(f"_run_prefill_context_chunk_trtllm_ragged attn_out: Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
+        path = Path("/home/scratch.okozlova_gpu_1/vllm/q_nofill.pt")
+        if nans and not path.exists(): 
+        # For repro when zero filling
+        # if k.shape == torch.Size([320, 16, 192]) and not path.exists(): 
+            torch.save(q, "q_nofill.pt")
+            torch.save(k, "q_nofill.pt")
+            torch.save(v, "q_nofill.pt")
+            print(f"O: {attn_out}")
+            torch.save(attn_out, "out_nofill.pt")
+
         # Convert from (q_len, num_heads) to (num_heads, q_len)
-        return attn_out, lse.transpose(0, 1).contiguous()
+        lse = lse.transpose(0, 1).contiguous()
+        return attn_out, lse
 
     def _concat_k_nope_k_pe(
         self, k_nope: torch.Tensor, k_pe: torch.Tensor
@@ -2258,6 +2324,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 k=k,
                 v=v,
             )
+
+            if self.detect_nans(attn_output):
+                print(f"Got nans in attn_output at {i} iter")
+                print(f"prefill_metadata:")
+                print(prefill_metadata.__dict__)
+            else:
+                print(f"_run_prefill_context_chunk is fine")
+
 
             if output is None:
                 output = attn_output
@@ -2414,6 +2488,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if has_context:
             suffix_output, suffix_lse = output_prefill
+
+            print("_run_prefill_new_tokens output:")
+            nans = self.detect_nans(suffix_output)
+            if not nans:
+                print("suffix_output is fine")
+
             if self.dcp_world_size > 1:
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
@@ -2428,6 +2508,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 context_output, context_lse = self._compute_prefill_context(
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale
                 )
+
+                print("_compute_prefill_context output:")
+                nans = self.detect_nans(context_output)
+                if not nans:
+                    print("context_output is fine")
+                else:
+                    print("GOTCHA")
 
             # unpad if necessary
             if self._pad_v:

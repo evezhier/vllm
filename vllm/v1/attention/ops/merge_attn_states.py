@@ -5,7 +5,6 @@ import torch
 
 from vllm.platforms import current_platform
 
-
 def merge_attn_states(
     output: torch.Tensor,
     prefix_output: torch.Tensor,
@@ -13,6 +12,7 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    token_mask = None
 ) -> None:
     # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
     # does not support FP8 dtype, fallback to use Triton kernel.
@@ -31,17 +31,21 @@ def merge_attn_states(
 
     if (
         current_platform.is_cuda()
+        and token_mask is None # TODO okozlova: CUDA kernel to accept mask too
         and supported_dtypes(output)
         and supported_headdim(output)
     ):
+        print(f"Running regular merge")
         from vllm._custom_ops import merge_attn_states
 
         return merge_attn_states(
             output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse
-        )
+        )    
+
     else:
+        print(f"Running triton merge")
         from vllm.v1.attention.ops.triton_merge_attn_states import merge_attn_states
 
         return merge_attn_states(
-            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse
+            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse, token_mask
         )

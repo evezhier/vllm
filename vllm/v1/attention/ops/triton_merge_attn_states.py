@@ -15,6 +15,7 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
+    token_mask: torch.Tensor | None = None
 ) -> None:
     num_tokens = output.shape[0]
     num_query_heads = output.shape[1]
@@ -38,6 +39,7 @@ def merge_attn_states(
         head_size,
         padded_head_size,
         output_lse is not None,
+        token_mask,
     )
 
 
@@ -54,13 +56,16 @@ def merge_attn_states_kernel(
     HEAD_SIZE: tl.constexpr,
     PADDED_HEAD_SIZE: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
+    token_mask: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     num_tokens = tl.num_programs(0)
     head_idx = tl.program_id(1)
     num_heads = tl.num_programs(1)
 
-    p_lse = tl.load(prefix_lse + head_idx * num_tokens + token_idx)
+    prefix_mask = token_idx < token_mask
+
+    p_lse = tl.load(prefix_lse + head_idx * num_tokens + token_idx, mask=prefix_mask, other=float("-inf"))
     s_lse = tl.load(suffix_lse + head_idx * num_tokens + token_idx)
 
     # FA2 and FA3 have different behavior for when the sum-exp is 0, this namely
@@ -85,12 +90,14 @@ def merge_attn_states_kernel(
 
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)
     head_mask = head_arange < HEAD_SIZE
+
     p_out = tl.load(
         prefix_output
         + token_idx * num_heads * prefix_head_stride
         + head_idx * prefix_head_stride
         + head_arange,
-        mask=head_mask,
+        mask=head_mask & prefix_mask,
+        other=0.0
     )
     s_out = tl.load(
         suffix_output

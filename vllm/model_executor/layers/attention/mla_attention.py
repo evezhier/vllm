@@ -2108,19 +2108,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # Indicates actual_seq_lens are on GPU or CPU.
             is_cuda_graph_compatible=True,
         )
-    
-    # def detect_nans(self, attn_out):
-    #     x = attn_out.detach().cpu()
-    #     nans = False
-    #     for dim in range(x.ndim):
-    #         other_dims = tuple(d for d in range(x.ndim) if d != dim)
-    #         if torch.isnan(x).any(dim=other_dims).all() or torch.isinf(x).any(dim=other_dims).all():
-    #             nans = True
-    #             print(f"Dimension {dim} is all NaNs")
-    #         elif torch.isnan(x).any(dim=other_dims).any() or torch.isinf(x).any(dim=other_dims).any():
-    #             nans = True
-    #             print(f"NaNs appear along dimension {dim}")
-    #     return nans
 
     def _run_prefill_new_tokens_trtllm_ragged(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
@@ -2131,15 +2118,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
 
-        logger.info_once(f"TRT-LLM ragged attention for new tokens (causal)  q: {q.shape}, k: {k.shape}, v: {v.shape}, \
-                         prefill.workspace_buffer: {prefill.workspace_buffer}, \
-                         seq_lens: {prefill.query_seq_lens}, \
-                        max_q_len: {prefill.max_query_len}, \
-                        max_kv_len: {prefill.max_query_len}, \
-                        bmm1_scale: {self.scale}, batch_size: {prefill.query_seq_lens.shape[0]}, \
-                        cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.query_start_loc}, \
-                        return_softmax_lse: {return_softmax_lse}"
-                        )
+        # logger.info_once(f"TRT-LLM ragged attention for new tokens (causal)  q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+        #                  prefill.workspace_buffer: {prefill.workspace_buffer}, \
+        #                  seq_lens: {prefill.query_seq_lens}, \
+        #                 max_q_len: {prefill.max_query_len}, \
+        #                 max_kv_len: {prefill.max_query_len}, \
+        #                 bmm1_scale: {self.scale}, batch_size: {prefill.query_seq_lens.shape[0]}, \
+        #                 cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.query_start_loc}, \
+        #                 return_softmax_lse: {return_softmax_lse}"
+        #                 )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2187,14 +2174,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         #     dtype=q.dtype,
         # )
         # prefill.workspace_buffer.fill_(0)
-        logger.info_once(
-            f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
-            prefill.workspace_buffer: {prefill.workspace_buffer}, \
-            seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
-            max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
-            bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
-            cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
-            )
+        # logger.info_once(
+        #     f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+        #     prefill.workspace_buffer: {prefill.workspace_buffer}, \
+        #     seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
+        #     max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
+        #     bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
+        #     cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
+        #     )
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2439,7 +2426,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
-        print(f"Running _run_prefill_new_tokens with attn_metadata: {attn_metadata}")
         output_prefill = self._run_prefill_new_tokens(
             prefill=attn_metadata.prefill,
             q=q,
@@ -2462,7 +2448,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     )
                 )
             else:
-                print(f"Running _compute_prefill_context with attn_metadata: {attn_metadata}")
                 context_output, context_lse = self._compute_prefill_context(
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale
                 )
@@ -2476,7 +2461,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             token_mask = torch.repeat_interleave(
                     torch.diff(attn_metadata.prefill.chunked_context.cu_seq_lens[0]) > 0, 
                     torch.diff(attn_metadata.prefill.query_start_loc))
-            print(f"token_mask: {token_mask}, token_mask.shape: {token_mask.shape}")
 
             merge_attn_states(
                 output=output,

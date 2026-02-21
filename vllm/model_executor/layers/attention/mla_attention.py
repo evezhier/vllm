@@ -2201,14 +2201,16 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
-        # allocate BF16 / FP16 output tensor for TRT-LLM ragged attention
-        out = torch.empty(
-            q.shape[0],
-            q.shape[1],
-            v.shape[2],
-            device=q.device,
-            dtype=prefill.output_dtype,
-        )
+
+        # logger.info_once(f"TRT-LLM ragged attention for new tokens (causal)  q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+        #                  prefill.workspace_buffer: {prefill.workspace_buffer}, \
+        #                  seq_lens: {prefill.query_seq_lens}, \
+        #                 max_q_len: {prefill.max_query_len}, \
+        #                 max_kv_len: {prefill.max_query_len}, \
+        #                 bmm1_scale: {self.scale}, batch_size: {prefill.query_seq_lens.shape[0]}, \
+        #                 cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.query_start_loc}, \
+        #                 return_softmax_lse: {return_softmax_lse}"
+        #                 )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2228,7 +2230,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             enable_pdl=False,
             is_causal=True,
             return_lse=return_softmax_lse,
-            out=out,
+            # out=out,
         )
 
         if isinstance(ret, tuple):
@@ -2254,14 +2256,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         #     dtype=q.dtype,
         # )
         # prefill.workspace_buffer.fill_(0)
-        logger.info_once(
-            f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
-            prefill.workspace_buffer: {prefill.workspace_buffer}, \
-            seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
-            max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
-            bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
-            cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
-            )
+        # logger.info_once(
+        #     f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+        #     prefill.workspace_buffer: {prefill.workspace_buffer}, \
+        #     seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
+        #     max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
+        #     bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
+        #     cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
+        #     )
 
         attn_out, lse = trtllm_ragged_attention_deepseek(
             query=q,
@@ -2571,7 +2573,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     )
                 )
             else:
-                print(f"Running _compute_prefill_context with attn_metadata: {attn_metadata}")
                 context_output, context_lse = self._compute_prefill_context(
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale
                 )

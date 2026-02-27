@@ -18,7 +18,7 @@ __global__ void merge_attn_states_kernel(
     const float* prefix_lse, const scalar_t* suffix_output,
     const float* suffix_lse, const uint num_tokens, const uint num_heads,
     const uint head_size, const uint prefix_head_stride,
-    const uint output_head_stride, const int64_t prefix_num_tokens) {
+    const uint output_head_stride, const int64_t real_num_tokens) {
   using pack_128b_t = uint4;
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
@@ -35,8 +35,6 @@ __global__ void merge_attn_states_kernel(
   const uint token_idx = token_head_idx / num_heads;
   const uint head_idx = token_head_idx % num_heads;
 
-  const bool has_prefix = static_cast<int64_t>(token_idx) < prefix_num_tokens;
-
   const uint pack_offset = pack_idx * pack_size;  // (0~15)*8, etc.
   const uint src_head_offset = token_idx * num_heads * prefix_head_stride +
                                head_idx * prefix_head_stride;
@@ -46,11 +44,8 @@ __global__ void merge_attn_states_kernel(
   const scalar_t* suffix_head_ptr = suffix_output + src_head_offset;
   scalar_t* output_head_ptr = output + dst_head_offset;
 
-  float p_lse = has_prefix
-    ? prefix_lse[head_idx * num_tokens + token_idx] 
-    : -std::numeric_limits<float>::infinity();
-
-  float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
+  float p_lse = prefix_lse[head_idx * real_num_tokens + token_idx];
+  float s_lse = suffix_lse[head_idx * real_num_tokens + token_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
@@ -67,14 +62,12 @@ __global__ void merge_attn_states_kernel(
   if (std::isinf(max_lse)) {
     if (pack_offset < head_size) {
       // Pack 128b load
-      pack_128b_t p_out_pack = has_prefix
-        ? reinterpret_cast<const pack_128b_t*>(prefix_head_ptr)[pack_offset / pack_size]
-        : reinterpret_cast<const pack_128b_t*>(suffix_head_ptr)[pack_offset / pack_size];
-
+      pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(
+        prefix_head_ptr)[pack_offset / pack_size];
       // Pack 128b storage
       reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_offset / pack_size] =
           p_out_pack;
-    }
+    } // copy input to output
     // We only need to write to output_lse once per head.
     if (output_lse != nullptr && pack_idx == 0) {
       output_lse[head_idx * num_tokens + token_idx] = max_lse;
@@ -82,14 +75,13 @@ __global__ void merge_attn_states_kernel(
     return;
   }
 
-  const float prefix_mask = has_prefix? 1.f : 0.f;
   p_lse = p_lse - max_lse;
   s_lse = s_lse - max_lse;
   const float p_se = expf(p_lse);
   const float s_se = expf(s_lse);
   const float out_se = p_se + s_se;
-  const float p_scale = p_se / out_se * prefix_mask;
-  const float s_scale = s_se / out_se * prefix_mask + (1.f - prefix_mask);
+  const float p_scale = p_se / out_se; // * mask;
+  const float s_scale = s_se / out_se; // * mask + (1.f - mask);
 
   if (pack_offset < head_size) {
     pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(
@@ -105,10 +97,13 @@ __global__ void merge_attn_states_kernel(
       const float p_out_f =
           vllm::to_float(reinterpret_cast<const scalar_t*>(&p_out_pack)[i]);
       const float s_out_f =
-          vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
-      // fma: a * b + c = p_out_f * p_scale + (s_out_f * s_scale)
-      
+            vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
+        // fma: a * b + c = p_out_f * p_scale + (s_out_f * s_scale)
       float o_out_f = p_out_f * p_scale + (s_out_f * s_scale);
+      // }
+      // else {
+      //   o_out_f = s_out_f;
+      // }
 
       // float -> half(uint16_t), bfloat16, float.
       vllm::from_float(reinterpret_cast<scalar_t*>(&o_out_pack)[i], o_out_f);
@@ -153,7 +148,7 @@ __global__ void merge_attn_states_kernel(
             reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
             reinterpret_cast<float*>(suffix_lse.data_ptr()), num_tokens,    \
             num_heads, head_size, prefix_head_stride, output_head_stride,   \
-            prefix_num_tokens);                                             \
+            real_num_tokens);                                             \
   }
 
 /*@brief Merges the attention states from prefix and suffix
@@ -183,8 +178,7 @@ void merge_attn_states_launcher(torch::Tensor& output,
   const uint prefix_head_stride = prefix_output.stride(1);
   const uint output_head_stride = output.stride(1);
   const uint pack_size = 16 / sizeof(scalar_t);
-  const int64_t prefix_num_tokens =
-    token_mask.value_or(std::numeric_limits<int64_t>::max());
+  
   TORCH_CHECK(head_size % pack_size == 0,
               "headsize must be multiple of pack_size:", pack_size);
   float* output_lse_ptr = nullptr;

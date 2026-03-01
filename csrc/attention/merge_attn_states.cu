@@ -18,7 +18,7 @@ __global__ void merge_attn_states_kernel(
     const float* prefix_lse, const scalar_t* suffix_output,
     const float* suffix_lse, const uint num_tokens, const uint num_heads,
     const uint head_size, const uint prefix_head_stride,
-    const uint output_head_stride, const int64_t real_num_tokens) {
+    const uint output_head_stride, const int64_t prefix_num_tokens) {
   using pack_128b_t = uint4;
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
@@ -40,12 +40,31 @@ __global__ void merge_attn_states_kernel(
                                head_idx * prefix_head_stride;
   const uint dst_head_offset = token_idx * num_heads * output_head_stride +
                                head_idx * output_head_stride;
-  const scalar_t* prefix_head_ptr = prefix_output + src_head_offset;
   const scalar_t* suffix_head_ptr = suffix_output + src_head_offset;
   scalar_t* output_head_ptr = output + dst_head_offset;
 
-  float p_lse = prefix_lse[head_idx * real_num_tokens + token_idx];
-  float s_lse = suffix_lse[head_idx * real_num_tokens + token_idx];
+  // If token_idx >= prefix_num_tokens, just copy from suffix
+  if (token_idx >= prefix_num_tokens) {
+    if (pack_offset < head_size) {
+      pack_128b_t s_out_pack = reinterpret_cast<const pack_128b_t*>(
+          suffix_head_ptr)[pack_offset / pack_size];
+      reinterpret_cast<pack_128b_t*>(output_head_ptr)[pack_offset / pack_size] =
+          s_out_pack;
+    }
+    if (output_lse != nullptr && pack_idx == 0) {
+      float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
+      output_lse[head_idx * num_tokens + token_idx] = s_lse;
+    }
+    return;
+  }
+
+  // For tokens within prefix range, merge prefix and suffix
+  const uint prefix_src_head_offset = token_idx * num_heads * prefix_head_stride +
+                                      head_idx * prefix_head_stride;
+  const scalar_t* prefix_head_ptr = prefix_output + prefix_src_head_offset;
+
+  float p_lse = prefix_lse[head_idx * prefix_num_tokens + token_idx];
+  float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;
 
@@ -148,20 +167,24 @@ __global__ void merge_attn_states_kernel(
             reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
             reinterpret_cast<float*>(suffix_lse.data_ptr()), num_tokens,    \
             num_heads, head_size, prefix_head_stride, output_head_stride,   \
-            real_num_tokens);                                             \
+            prefix_num_tokens);                                             \
   }
 
 /*@brief Merges the attention states from prefix and suffix
  * into the output tensor. NUM_TOKENS: n, NUM_HEADS: h, HEAD_SIZE: d
  *
  * @param output [n,h,d] The output tensor to store the merged attention states.
- * @param output_lse [h,d] Optional tensor to store the log-sum-exp values.
- * @param prefix_output [n,h,d] The prefix attention states.
- * @param prefix_lse [h,n] The log-sum-exp values for the prefix attention
+ * @param output_lse [h,n] Optional tensor to store the log-sum-exp values.
+ * @param prefix_output [p,h,d] The prefix attention states (p <= n).
+ * @param prefix_lse [h,p] The log-sum-exp values for the prefix attention
  * states.
  * @param suffix_output [n,h,d] The suffix attention states.
  * @param suffix_lse [h,n] The log-sum-exp values for the suffix attention
  * states.
+ *
+ * For the first p tokens (0 <= token_idx < p), output is computed by merging
+ * prefix_output and suffix_output. For remaining tokens (p <= token_idx < n),
+ * output is copied directly from suffix_output.
  */
 template <typename scalar_t>
 void merge_attn_states_launcher(torch::Tensor& output,
@@ -172,15 +195,23 @@ void merge_attn_states_launcher(torch::Tensor& output,
                                 const torch::Tensor& suffix_lse,
                                 const std::optional<int64_t> token_mask) {
   constexpr uint NUM_THREADS = 128;
-  const uint num_tokens = output.size(0);
+  // prefix_num_tokens is the actual size of prefix tensors (can be smaller)
+  const int64_t prefix_num_tokens = prefix_output.size(0);
+  // num_tokens is the total number of output tokens to process
+  const int64_t num_tokens = output.size(0);
   const uint num_heads = output.size(1);
   const uint head_size = output.size(2);
   const uint prefix_head_stride = prefix_output.stride(1);
   const uint output_head_stride = output.stride(1);
   const uint pack_size = 16 / sizeof(scalar_t);
-  
+
   TORCH_CHECK(head_size % pack_size == 0,
               "headsize must be multiple of pack_size:", pack_size);
+  TORCH_CHECK(prefix_num_tokens <= num_tokens,
+              "prefix_num_tokens must be <= num_tokens");
+  TORCH_CHECK(prefix_lse.size(1) == prefix_num_tokens,
+              "prefix_lse dimension 1 must match prefix_output dimension 0");
+
   float* output_lse_ptr = nullptr;
   if (output_lse.has_value()) {
     output_lse_ptr = output_lse.value().data_ptr<float>();

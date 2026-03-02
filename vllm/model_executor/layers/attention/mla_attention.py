@@ -261,6 +261,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 logger = init_logger(__name__)
 
 
@@ -2247,44 +2249,45 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill.chunked_context is not None
         assert prefill.chunked_context.seq_lens[chunk_idx] is not None
         assert prefill.workspace_buffer is not None
+        with record_function_or_nullcontext("non-causal attn"):
+            with record_function_or_nullcontext("fills"):
+                out = torch.empty(
+                    q.shape[0],
+                    q.shape[1],
+                    v.shape[2],
+                    device=q.device,
+                    dtype=q.dtype,
+                )
+            # prefill.workspace_buffer.fill_(0)
+            # logger.info_once(
+            #     f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
+            #     prefill.workspace_buffer: {prefill.workspace_buffer}, \
+            #     seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
+            #     max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
+            #     bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
+            #     cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
+            #     )
 
-        # out = torch.zeros(
-        #     q.shape[0],
-        #     q.shape[1],
-        #     v.shape[2],
-        #     device=q.device,
-        #     dtype=q.dtype,
-        # )
-        # prefill.workspace_buffer.fill_(0)
-        # logger.info_once(
-        #     f"Running TRT-LLM ragged attention for context chunks (non-causal)  chunk_idx: {chunk_idx}, q: {q.shape}, k: {k.shape}, v: {v.shape}, \
-        #     prefill.workspace_buffer: {prefill.workspace_buffer}, \
-        #     seq_lens: {prefill.chunked_context.seq_lens[chunk_idx]}, \
-        #     max_q_len: {prefill.max_query_len}, max_kv_len: {prefill.chunked_context.max_seq_lens[chunk_idx]}, \
-        #     bmm1_scale: {self.scale}, batch_size: {prefill.chunked_context.seq_lens[chunk_idx].shape[0]}, \
-        #     cum_seq_lens_q: {prefill.query_start_loc}, cum_seq_lens_kv: {prefill.chunked_context.cu_seq_lens[chunk_idx]}"
-        #     )
-
-        attn_out, lse = trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=prefill.workspace_buffer,
-            seq_lens=prefill.chunked_context.seq_lens[chunk_idx],
-            max_q_len=prefill.max_query_len,
-            max_kv_len=prefill.chunked_context.max_seq_lens[chunk_idx],
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
-            o_sf_scale=1.0,
-            batch_size=prefill.chunked_context.seq_lens[chunk_idx].shape[0],
-            window_left=-1,
-            cum_seq_lens_q=prefill.query_start_loc,
-            cum_seq_lens_kv=prefill.chunked_context.cu_seq_lens[chunk_idx],
-            enable_pdl=False,
-            is_causal=False,
-            return_lse=True,
-            # out=out,
-        )
+            attn_out, lse = trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=prefill.workspace_buffer,
+                seq_lens=prefill.chunked_context.seq_lens[chunk_idx],
+                max_q_len=prefill.max_query_len,
+                max_kv_len=prefill.chunked_context.max_seq_lens[chunk_idx],
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                o_sf_scale=1.0,
+                batch_size=prefill.chunked_context.seq_lens[chunk_idx].shape[0],
+                window_left=-1,
+                cum_seq_lens_q=prefill.query_start_loc,
+                cum_seq_lens_kv=prefill.chunked_context.cu_seq_lens[chunk_idx],
+                enable_pdl=False,
+                is_causal=False,
+                return_lse=True,
+                out=out,
+            )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
@@ -2529,76 +2532,78 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_scale: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        # TODO (zyongye): Prefill function here
-        assert attn_metadata.prefill is not None
-        assert self.dcp_world_size != -1
+        with record_function_or_nullcontext("forward_mha"):
+            # TODO (zyongye): Prefill function here
+            assert attn_metadata.prefill is not None
+            assert self.dcp_world_size != -1
 
-        prefill_metadata = attn_metadata.prefill
-        use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
+            prefill_metadata = attn_metadata.prefill
+            use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()
 
-        # Convert q to FP8 if FP8 prefill attention is enabled
-        if use_fp8_prefill:
-            q = q.to(prefill_metadata.q_data_type)
+            # Convert q to FP8 if FP8 prefill attention is enabled
+            if use_fp8_prefill:
+                q = q.to(prefill_metadata.q_data_type)
 
-        has_context = prefill_metadata.chunked_context is not None
+            has_context = prefill_metadata.chunked_context is not None
 
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
-        if use_fp8_prefill:
-            k = k.to(prefill_metadata.q_data_type)
-            v = v.to(prefill_metadata.q_data_type)
+            if use_fp8_prefill:
+                k = k.to(prefill_metadata.q_data_type)
+                v = v.to(prefill_metadata.q_data_type)
 
-        output_prefill = self._run_prefill_new_tokens(
-            prefill=prefill_metadata,
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-        )
-
-        if has_context:
-            suffix_output, suffix_lse = output_prefill
-            if self.dcp_world_size > 1:
-                context_output, context_lse = (
-                    self._context_parallel_compute_prefill_context(
-                        q,
-                        kv_c_and_k_pe_cache,
-                        attn_metadata,
-                        k_scale=None,
-                        dcp_world_size=self.dcp_world_size,
-                    )
-                )
-            else:
-                context_output, context_lse = self._compute_prefill_context(
-                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale
-                )
-
-            # unpad if necessary
-            if self._pad_v:
-                context_output = context_output[..., : v.shape[-1]]
-                suffix_output = suffix_output[..., : v.shape[-1]]
-
-            output = output.view(-1, self.num_heads, self.v_head_dim)
-            token_mask = torch.repeat_interleave(
-                    torch.diff(attn_metadata.prefill.chunked_context.cu_seq_lens[0]) > 0, 
-                    torch.diff(attn_metadata.prefill.query_start_loc)).sum().item()
-
-            merge_attn_states(
-                output=output,
-                prefix_output=context_output,
-                prefix_lse=context_lse,
-                suffix_output=suffix_output,
-                suffix_lse=suffix_lse,
-                token_mask=context_output.shape[0],
+            output_prefill = self._run_prefill_new_tokens(
+                prefill=prefill_metadata,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
             )
 
-        else:
-            output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
-            output.copy_(output_prefill)
+            if has_context:
+                suffix_output, suffix_lse = output_prefill
+                if self.dcp_world_size > 1:
+                    context_output, context_lse = (
+                        self._context_parallel_compute_prefill_context(
+                            q,
+                            kv_c_and_k_pe_cache,
+                            attn_metadata,
+                            k_scale=None,
+                            dcp_world_size=self.dcp_world_size,
+                        )
+                    )
+                else:
+                    context_output, context_lse = self._compute_prefill_context(
+                        q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                    )
+
+                # unpad if necessary
+                if self._pad_v:
+                    context_output = context_output[..., : v.shape[-1]]
+                    suffix_output = suffix_output[..., : v.shape[-1]]
+
+                output = output.view(-1, self.num_heads, self.v_head_dim)
+                token_mask = torch.repeat_interleave(
+                        torch.diff(attn_metadata.prefill.chunked_context.cu_seq_lens[0]) > 0, 
+                        torch.diff(attn_metadata.prefill.query_start_loc)).sum().item()
+
+                with record_function_or_nullcontext("merge_attn_states"):
+                    merge_attn_states(
+                        output=output,
+                        prefix_output=context_output,
+                        prefix_lse=context_lse,
+                        suffix_output=suffix_output,
+                        suffix_lse=suffix_lse,
+                        token_mask=context_output.shape[0],
+                    )
+
+            else:
+                output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
+                output.copy_(output_prefill)
 
     @abstractmethod
     def forward_mqa(

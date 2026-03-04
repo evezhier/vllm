@@ -63,7 +63,7 @@ __global__ void merge_attn_states_kernel(
                                       head_idx * prefix_head_stride;
   const scalar_t* prefix_head_ptr = prefix_output + prefix_src_head_offset;
 
-  float p_lse = prefix_lse[head_idx * prefix_num_tokens + token_idx];
+  float p_lse = prefix_lse[head_idx * num_tokens + token_idx];
   float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
   s_lse = std::isinf(s_lse) ? -std::numeric_limits<float>::infinity() : s_lse;

@@ -2587,9 +2587,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     suffix_output = suffix_output[..., : v.shape[-1]]
 
                 output = output.view(-1, self.num_heads, self.v_head_dim)
-                token_mask = torch.repeat_interleave(
-                        torch.diff(attn_metadata.prefill.chunked_context.cu_seq_lens[0]) > 0, 
-                        torch.diff(attn_metadata.prefill.query_start_loc)).sum().item()
+
+                token_mask = attn_metadata.prefill.query_start_loc[
+                    torch.nonzero(attn_metadata.prefill.chunked_context.seq_lens).sum().item()]
 
                 with record_function_or_nullcontext("merge_attn_states"):
                     merge_attn_states(

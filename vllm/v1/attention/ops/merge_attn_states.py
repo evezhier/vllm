@@ -12,7 +12,7 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
-    token_mask: int | None = None
+    prefix_num_tokens: int | None = None
 ) -> None:
     # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
     # does not support FP8 dtype, fallback to use Triton kernel.
@@ -37,12 +37,12 @@ def merge_attn_states(
         from vllm._custom_ops import merge_attn_states
 
         return merge_attn_states(
-            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse, token_mask
+            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse, prefix_num_tokens
         )    
 
     else:
         from vllm.v1.attention.ops.triton_merge_attn_states import merge_attn_states
 
         return merge_attn_states(
-            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse, token_mask
+            output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse, prefix_num_tokens
         )

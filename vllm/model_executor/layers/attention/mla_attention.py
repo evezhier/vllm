@@ -2598,7 +2598,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                         prefix_lse=context_lse,
                         suffix_output=suffix_output,
                         suffix_lse=suffix_lse,
-                        token_mask=context_output.shape[0],
+                        prefix_num_tokens=token_mask,
                     )
 
             else:

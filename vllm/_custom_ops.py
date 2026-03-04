@@ -189,10 +189,10 @@ def merge_attn_states(
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
     output_lse: torch.Tensor | None = None,
-    token_mask: int | None = None,
+    prefix_num_tokens: int | None = None,
 ) -> None:
     torch.ops._C.merge_attn_states(
-        output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse, token_mask
+        output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse, prefix_num_tokens
     )
 
 

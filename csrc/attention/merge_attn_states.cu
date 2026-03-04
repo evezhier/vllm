@@ -18,7 +18,7 @@ __global__ void merge_attn_states_kernel(
     const float* prefix_lse, const scalar_t* suffix_output,
     const float* suffix_lse, const uint num_tokens, const uint num_heads,
     const uint head_size, const uint prefix_head_stride,
-    const uint output_head_stride, const int64_t prefix_num_tokens) {
+    const uint output_head_stride, const uint prefix_num_tokens_n) {
   using pack_128b_t = uint4;
   const uint pack_size = 16 / sizeof(scalar_t);
   const uint threads_per_head = head_size / pack_size;
@@ -40,11 +40,12 @@ __global__ void merge_attn_states_kernel(
                                head_idx * prefix_head_stride;
   const uint dst_head_offset = token_idx * num_heads * output_head_stride +
                                head_idx * output_head_stride;
+  const scalar_t* prefix_head_ptr = prefix_output + src_head_offset;
   const scalar_t* suffix_head_ptr = suffix_output + src_head_offset;
   scalar_t* output_head_ptr = output + dst_head_offset;
 
   // If token_idx >= prefix_num_tokens, just copy from suffix
-  if (token_idx >= prefix_num_tokens) {
+  if (token_idx >= prefix_num_tokens_n) {
     if (pack_offset < head_size) {
       pack_128b_t s_out_pack = reinterpret_cast<const pack_128b_t*>(
           suffix_head_ptr)[pack_offset / pack_size];
@@ -59,10 +60,6 @@ __global__ void merge_attn_states_kernel(
   }
 
   // For tokens within prefix range, merge prefix and suffix
-  const uint prefix_src_head_offset = token_idx * num_heads * prefix_head_stride +
-                                      head_idx * prefix_head_stride;
-  const scalar_t* prefix_head_ptr = prefix_output + prefix_src_head_offset;
-
   float p_lse = prefix_lse[head_idx * num_tokens + token_idx];
   float s_lse = suffix_lse[head_idx * num_tokens + token_idx];
   p_lse = std::isinf(p_lse) ? -std::numeric_limits<float>::infinity() : p_lse;
@@ -99,8 +96,8 @@ __global__ void merge_attn_states_kernel(
   const float p_se = expf(p_lse);
   const float s_se = expf(s_lse);
   const float out_se = p_se + s_se;
-  const float p_scale = p_se / out_se; // * mask;
-  const float s_scale = s_se / out_se; // * mask + (1.f - mask);
+  const float p_scale = p_se / out_se;
+  const float s_scale = s_se / out_se;
 
   if (pack_offset < head_size) {
     pack_128b_t p_out_pack = reinterpret_cast<const pack_128b_t*>(
@@ -119,11 +116,6 @@ __global__ void merge_attn_states_kernel(
             vllm::to_float(reinterpret_cast<const scalar_t*>(&s_out_pack)[i]);
         // fma: a * b + c = p_out_f * p_scale + (s_out_f * s_scale)
       float o_out_f = p_out_f * p_scale + (s_out_f * s_scale);
-      // }
-      // else {
-      //   o_out_f = s_out_f;
-      // }
-
       // float -> half(uint16_t), bfloat16, float.
       vllm::from_float(reinterpret_cast<scalar_t*>(&o_out_pack)[i], o_out_f);
     }
@@ -167,7 +159,7 @@ __global__ void merge_attn_states_kernel(
             reinterpret_cast<scalar_t*>(suffix_output.data_ptr()),          \
             reinterpret_cast<float*>(suffix_lse.data_ptr()), num_tokens,    \
             num_heads, head_size, prefix_head_stride, output_head_stride,   \
-            prefix_num_tokens);                                             \
+            prefix_num_tokens_n);                                             \
   }
 
 /*@brief Merges the attention states from prefix and suffix
@@ -193,10 +185,8 @@ void merge_attn_states_launcher(torch::Tensor& output,
                                 const torch::Tensor& prefix_lse,
                                 const torch::Tensor& suffix_output,
                                 const torch::Tensor& suffix_lse,
-                                const std::optional<int64_t> token_mask) {
+                                const std::optional<int64_t> prefix_num_tokens) {
   constexpr uint NUM_THREADS = 128;
-  // prefix_num_tokens is the actual size of prefix tensors (can be smaller)
-  const int64_t prefix_num_tokens = prefix_output.size(0);
   // num_tokens is the total number of output tokens to process
   const int64_t num_tokens = output.size(0);
   const uint num_heads = output.size(1);
@@ -207,10 +197,13 @@ void merge_attn_states_launcher(torch::Tensor& output,
 
   TORCH_CHECK(head_size % pack_size == 0,
               "headsize must be multiple of pack_size:", pack_size);
-  TORCH_CHECK(prefix_num_tokens <= num_tokens,
+
+  // Default to num_tokens if not specified (no padding)
+  const uint prefix_num_tokens_n = prefix_num_tokens.has_value()
+      ? static_cast<uint>(prefix_num_tokens.value())
+      : num_tokens;
+  TORCH_CHECK(prefix_num_tokens_n <= num_tokens,
               "prefix_num_tokens must be <= num_tokens");
-  TORCH_CHECK(prefix_lse.size(1) == prefix_num_tokens,
-              "prefix_lse dimension 1 must match prefix_output dimension 0");
 
   float* output_lse_ptr = nullptr;
   if (output_lse.has_value()) {
@@ -234,7 +227,7 @@ void merge_attn_states_launcher(torch::Tensor& output,
   {                                                                         \
     merge_attn_states_launcher<scalar_t>(output, output_lse, prefix_output, \
                                          prefix_lse, suffix_output,         \
-                                         suffix_lse, token_mask);           \
+                                         suffix_lse, prefix_num_tokens);           \
   }
 
 void merge_attn_states(torch::Tensor& output,
@@ -243,6 +236,6 @@ void merge_attn_states(torch::Tensor& output,
                        const torch::Tensor& prefix_lse,
                        const torch::Tensor& suffix_output,
                        const torch::Tensor& suffix_lse,
-                       const std::optional<int64_t> token_mask) {
+                       std::optional<int64_t> prefix_num_tokens = std::nullopt) {
   DISPATCH_BY_SCALAR_DTYPE(output.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER);
 }

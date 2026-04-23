@@ -10,7 +10,7 @@
 from abc import abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
 from functools import cached_property
-from typing import Annotated, Literal, TypeAlias, TypeVar
+from typing import Annotated, Any, ClassVar, Literal, TypeAlias, TypeVar
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,7 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMultiModal,
     SupportsPP,
@@ -542,8 +543,11 @@ class InternVLMultiModalProcessor(
     info=InternVLProcessingInfo,
     dummy_inputs=InternVLDummyInputsBuilder,
 )
-class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA):
+class InternVLChatModel(
+    nn.Module, SupportsMultiModal, SupportsEncoderCudaGraph, SupportsPP, SupportsLoRA
+):
     supports_encoder_tp_data = True
+    supports_encoder_cudagraph: ClassVar[Literal[True]] = True
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -562,6 +566,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
+        self.model_config = vllm_config.model_config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self._patch_quant_config(config, quant_config)
@@ -882,6 +887,163 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    # -- SupportsEncoderCudaGraph protocol methods --
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
+
+        modalities = ["image"]
+        if self.multimodal_config.get_limit_per_prompt("video") > 0:
+            modalities.append("video")
+
+        return EncoderCudaGraphConfig(
+            modalities=modalities,
+            input_key_by_modality={
+                "image": "pixel_values_flat",
+                "video": "pixel_values_flat_video",
+            },
+            # InternVL's ViT uses a learned position_embedding parameter (not
+            # runtime-computed RoPE), so no dynamic metadata buffers are needed.
+            buffer_keys=[],
+            out_hidden_size=self.config.text_config.hidden_size,
+        )
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return "image" if "pixel_values_flat" in mm_kwargs else "video"
+
+    def get_max_frames_per_video(self) -> int:
+        info = MULTIMODAL_REGISTRY.get_processing_info(self.model_config)
+        return info.get_num_frames_with_most_features(
+            seq_len=self.model_config.max_model_len,
+            mm_counts={
+                "video": self.multimodal_config.get_limit_per_prompt("video"),
+            },
+        )
+
+    def get_encoder_cudagraph_budget_range(
+        self, vllm_config: VllmConfig
+    ) -> tuple[int, int]:
+        # min: 1 tile → num_image_token output tokens
+        min_budget = self.num_image_token
+        max_budget = vllm_config.scheduler_config.max_num_batched_tokens
+        return (min_budget, max_budget)
+
+    def _get_num_patches_list(self, mm_kwargs: dict[str, Any]) -> list[int]:
+        key = (
+            "image_num_patches"
+            if self.get_input_modality(mm_kwargs) == "image"
+            else "video_num_patches"
+        )
+        v = mm_kwargs[key]
+        return v.tolist() if isinstance(v, torch.Tensor) else list(v)
+
+    def get_encoder_cudagraph_num_items(self, mm_kwargs: dict[str, Any]) -> int:
+        return len(self._get_num_patches_list(mm_kwargs))
+
+    def get_encoder_cudagraph_per_item_output_tokens(
+        self, mm_kwargs: dict[str, Any]
+    ) -> list[int]:
+        return [p * self.num_image_token for p in self._get_num_patches_list(mm_kwargs)]
+
+    def get_encoder_cudagraph_per_item_input_sizes(
+        self, mm_kwargs: dict[str, Any]
+    ) -> list[int]:
+        return self._get_num_patches_list(mm_kwargs)
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        modality = self.get_input_modality(mm_kwargs)
+        pv_key = (
+            "pixel_values_flat" if modality == "image" else "pixel_values_flat_video"
+        )
+        np_key = (
+            "image_num_patches" if modality == "image" else "video_num_patches"
+        )
+
+        num_patches = self._get_num_patches_list(mm_kwargs)
+        pixel_values = mm_kwargs[pv_key]
+
+        cum = [0]
+        for p in num_patches:
+            cum.append(cum[-1] + p)
+
+        selected_pv = (
+            torch.cat([pixel_values[cum[i] : cum[i + 1]] for i in indices])
+            if indices
+            else pixel_values[:0]
+        )
+        selected_np = torch.tensor([num_patches[i] for i in indices])
+
+        return {pv_key: selected_pv, np_key: selected_np}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
+
+        assert getattr(self.config, "force_image_size", None) is not None, (
+            "InternVL encoder CUDA graphs require force_image_size to be set "
+            "in the model config (the position_embedding interpolation path "
+            "in InternVisionEmbeddings is a graph breaker)."
+        )
+
+        per_item_tiles = max(
+            1, (token_budget // max_batch_size) // self.num_image_token
+        )
+        total_tiles = per_item_tiles * max_batch_size
+        image_size = self.config.vision_config.image_size
+
+        dummy_pv = torch.randn(
+            total_tiles, 3, image_size, image_size, device=device, dtype=dtype
+        )
+        dummy_np = torch.tensor([per_item_tiles] * max_batch_size)
+
+        return EncoderCudaGraphCaptureInputs(
+            mm_kwargs={
+                "pixel_values_flat": dummy_pv,
+                "image_num_patches": dummy_np,
+            },
+            buffers={},
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
+
+        # InternVL's ViT has no runtime-computed metadata (no RoPE, no
+        # cu_seqlens), so there is nothing to inject before replay.
+        return EncoderCudaGraphReplayBuffers(buffers={})
+
+    def encoder_cudagraph_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        buffers: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        pv_key = (
+            "pixel_values_flat"
+            if self.get_input_modality(mm_kwargs) == "image"
+            else "pixel_values_flat_video"
+        )
+        pixel_values = mm_kwargs[pv_key]
+        # extract_feature: ViT → strip CLS → pixel_shuffle → mlp1
+        feats = self.extract_feature(pixel_values)  # [N_tiles, num_image_token, H]
+        return feats.view(-1, self.config.text_config.hidden_size)
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any]) -> torch.Tensor:
+        return self.encoder_cudagraph_forward(mm_kwargs, {})
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # unused modules appear in OpenGVLab/InternVideo2_5_Chat_8B

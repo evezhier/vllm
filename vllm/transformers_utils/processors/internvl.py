@@ -458,7 +458,14 @@ class InternVLProcessor(ProcessorMixin):
             self.start_image_token + repl_features + self.end_image_token
         )
         # num_patches is equal to num_frames
-        repl_full = "".join(
+        # Prepend end_image_token so repl_full begins with a special token.
+        # Without this, BPE merges the preceding character (e.g. ".") with
+        # "Frame", so standalone tokenization of repl_full differs from the
+        # in-context tokenization produced by the HF processor.  Special
+        # tokens are never subject to BPE merging, so starting with
+        # end_image_token makes both tokenizations identical and lets
+        # _find_mm_placeholders locate the video tokens in the prompt.
+        repl_full = self.end_image_token + "".join(
             [f"Frame{i + 1}: {repl_features_with_sep}" for i in range(num_patches)]
         )
 

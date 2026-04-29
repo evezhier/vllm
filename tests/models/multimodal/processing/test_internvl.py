@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for InternVL's multimodal preprocessing kwargs."""
+"""Tests for InternVL's multimodal preprocessing and CUDA graph support."""
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
+import torch
 from PIL import Image
 from transformers import PretrainedConfig
 
+from vllm.model_executor.models.internvl import InternVLChatModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.image import rescale_image_size
 from vllm.multimodal.processing import BaseMultiModalProcessor
@@ -133,3 +136,59 @@ def test_processor_override(
         max_num,
         hf_processor_mm_kwargs,
     )
+
+_IMAGE_SIZE = 2
+_VIT_HIDDEN = 1
+_LLM_HIDDEN = 1
+_NUM_IMAGE_TOKEN = 1  # int((2//2)^2 * 1.0^2)
+
+
+class _VisionModelStub(torch.nn.Module):
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        N = pixel_values.shape[0]
+        val = pixel_values.mean(dim=(1, 2, 3)).view(N, 1, 1)
+        return val.expand(N, (_IMAGE_SIZE // 2) ** 2 + 1, _VIT_HIDDEN).contiguous()
+
+
+class _ProjectorStub(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+
+def _make_internvl_model() -> InternVLChatModel:
+    model = object.__new__(InternVLChatModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        force_image_size=_IMAGE_SIZE,
+        vision_config=SimpleNamespace(image_size=_IMAGE_SIZE),
+        text_config=SimpleNamespace(hidden_size=_LLM_HIDDEN),
+    )
+    model.num_image_token = _NUM_IMAGE_TOKEN
+    model.patch_tokens = (_IMAGE_SIZE // 2) ** 2
+    model.downsample_ratio = 1.0
+    model.ps_version = "v2"
+    model.multimodal_config = SimpleNamespace(
+        get_limit_per_prompt=lambda modality: 0,
+    )
+    model.vision_model = _VisionModelStub()
+    model.mlp1 = _ProjectorStub()
+    return model
+
+
+def test_encoder_cudagraph_forward_matches_eager():
+    model = _make_internvl_model()
+    mm_kwargs = {
+        "pixel_values_flat": torch.stack(
+            [
+                torch.full((3, _IMAGE_SIZE, _IMAGE_SIZE), 1.0),
+                torch.full((3, _IMAGE_SIZE, _IMAGE_SIZE), 2.0),
+            ]
+        ),
+    }
+
+    eager = model.encoder_eager_forward(mm_kwargs)
+    graph = model.encoder_cudagraph_forward(mm_kwargs, buffers={})
+
+    expected = torch.tensor([[2.0], [3.0]])
+    assert torch.equal(eager, expected)
+    assert torch.equal(eager, graph)

@@ -52,6 +52,7 @@ from vllm.transformers_utils.processors.internvl import (
     InternVLVideoProcessor,
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.utils import record_function_or_nullcontext
 
 from .interfaces import (
     MultiModalEmbeddings,
@@ -671,14 +672,15 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         return x
 
     def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        vit_embeds = self.vision_model(pixel_values=pixel_values)
-        vit_embeds = vit_embeds[:, 1:, :]
+        with record_function_or_nullcontext("internvl: vision_encoder"):
+            vit_embeds = self.vision_model(pixel_values=pixel_values)
+            vit_embeds = vit_embeds[:, 1:, :]
 
-        h = w = int(vit_embeds.shape[1] ** 0.5)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-        vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)
+            h = w = int(vit_embeds.shape[1] ** 0.5)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+            vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
 
     def _parse_and_validate_image_input(
@@ -871,7 +873,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
             forward_kwargs.update({"visual_token_mask": self.visual_token_mask})
             self.visual_token_mask = None
 
-        hidden_states = self.language_model.model(**forward_kwargs)
+        with record_function_or_nullcontext("internvl: language_model"):
+            hidden_states = self.language_model.model(**forward_kwargs)
         return hidden_states
 
     def compute_logits(

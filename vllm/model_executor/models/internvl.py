@@ -729,7 +729,7 @@ class InternVLChatModel(
     ) -> InternVLVideoPixelInputs | None:
         pixel_values_flat_video = kwargs.pop("pixel_values_flat_video", None)
         video_num_patches = kwargs.pop("video_num_patches", None)
-        video_embeds = kwargs.pop("image_embeds", None)
+        video_embeds = kwargs.pop("video_embeds", None)
 
         if pixel_values_flat_video is None and video_embeds is None:
             return None
@@ -996,10 +996,15 @@ class InternVLChatModel(
             "in InternVisionEmbeddings is a graph breaker)."
         )
 
-        per_item_tiles = max(
-            1, (token_budget // max_batch_size) // self.num_image_token
-        )
-        total_tiles = per_item_tiles * max_batch_size
+        # total_tiles must cover the full token budget so the input buffer can
+        # hold any batch the greedy packer may produce for this budget level.
+        # Computing via (budget // max_batch_size) // num_image_token loses two
+        # remainders and produces a buffer smaller than the budget allows,
+        # causing an IndexError during replay when n > total_tiles.
+        # max(1, ...) guards sub-tile budgets (e.g. budget=128 < num_image_token=256)
+        # which are captured but never replayed since no item fits in them.
+        total_tiles = max(1, token_budget // self.num_image_token)
+        per_item_tiles = max(1, total_tiles // max_batch_size)
         image_size = self.config.vision_config.image_size
 
         dummy_pv = torch.randn(

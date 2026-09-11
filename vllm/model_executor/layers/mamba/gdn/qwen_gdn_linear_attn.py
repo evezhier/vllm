@@ -1898,6 +1898,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             return
         # Prefill, mixed batches and decode fallbacks retain zeroed padding.
+        # Specialized MTP decode kernel will zero the padding directly.
         core_attn_out.zero_()
         self._forward_core(
             mixed_qkv=mixed_qkv,

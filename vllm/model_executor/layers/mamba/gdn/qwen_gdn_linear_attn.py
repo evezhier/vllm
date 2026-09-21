@@ -44,6 +44,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from vllm.model_executor.layers.mamba.ops.gdn_norm import gdn_norm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
@@ -1024,7 +1025,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         if use_fused_gdn_decode:
             # Padding slots are guaranteed to be cleared to avoid NaN
-            # Either with .zero_() or inlined within the GDN kernel 
+            # Either with .zero_() or inlined within the GDN kernel
             core_attn_out = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -1374,6 +1375,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
     ):
         """Core conv1d + recurrent attention (standard path).
 
@@ -1382,6 +1384,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b: beta gating vector                   (num_tokens, num_heads)
             a: alpha gating vector                  (num_tokens, num_heads)
             core_attn_out: Pre-allocated output buffer for attention results.
+            output_gate: Optional gate for fused prefill normalization and scatter.
 
         """
         forward_context = get_forward_context()
@@ -1678,6 +1681,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, last_recurrent_state = None, None
 
         # 3. Merge core attention output
+        if output_gate is not None:
+            assert attn_metadata.num_prefills > 0
+            if spec_sequence_masks is not None:
+                self._rms_norm_gated_cuda(
+                    core_attn_out_spec.squeeze(0),
+                    output_gate,
+                    core_attn_out,
+                    token_indices=spec_token_indx,
+                )
+                self._rms_norm_gated_cuda(
+                    core_attn_out_non_spec.squeeze(0),
+                    output_gate,
+                    core_attn_out,
+                    token_indices=non_spec_token_indx,
+                )
+            else:
+                self._rms_norm_gated_cuda(
+                    core_attn_out_non_spec.squeeze(0),
+                    output_gate[:num_actual_tokens],
+                    core_attn_out[:num_actual_tokens],
+                )
+            return
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             core_attn_out.index_copy_(0, spec_token_indx, core_attn_out_spec.squeeze(0))
             core_attn_out.index_copy_(
@@ -1944,33 +1969,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         x: torch.Tensor,
         output_gate: torch.Tensor,
         out: torch.Tensor,
+        token_indices: torch.Tensor | None = None,
     ) -> None:
-        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
-            layer_norm_fwd,
-        )
-
-        x_shape = x.shape
-        assert output_gate.shape == x_shape
-        assert out.shape == x_shape
-        x_2d = x.reshape(-1, x_shape[-1])
-        output_gate_2d = output_gate.reshape(-1, x_shape[-1])
-        out_2d = out.reshape(-1, x_shape[-1])
-        assert x_2d.stride(-1) == 1
-        assert output_gate_2d.stride(-1) == 1
-        assert out_2d.stride(-1) == 1
-        layer_norm_fwd(
-            x_2d,
+        gdn_norm(
+            x,
+            output_gate,
             self.norm.weight.contiguous(),
             self.norm.bias,
+            out,
             self.norm.eps,
-            z=output_gate_2d,
-            out=out_2d,
-            group_size=(
-                x_shape[-1] if self.norm.group_size is None else self.norm.group_size
-            ),
+            group_size=self.norm.group_size,
             norm_before_gate=self.norm.norm_before_gate,
-            is_rms_norm=True,
             activation=self.norm.activation,
+            token_indices=token_indices,
         )
 
     def _forward_core_fused_norm(
@@ -2013,7 +2024,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             b=b.contiguous(),
             a=a.contiguous(),
             core_attn_out=core_attn_out,
+            output_gate=output_gate if attn_metadata.num_prefills > 0 else None,
         )
+        if attn_metadata.num_prefills > 0:
+            return
         num_actual_tokens = attn_metadata.num_actual_tokens
         self._rms_norm_gated_cuda(
             core_attn_out[:num_actual_tokens],
